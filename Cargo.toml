@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 slint = { git = "https://github.com/slint-ui/slint", branch = "master" }
 chrono = "0.4"
+# Terminal/sixel backend (see src/sixel_backend.rs):
+crossterm = "0.28"
+icy_sixel = "0.1"
 
 [build-dependencies]
 slint-build = { git = "https://github.com/slint-ui/slint", branch = "master" }

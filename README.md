@@ -38,6 +38,28 @@ Uses **Slint 1.17 from the `master` branch** (git dependency in `Cargo.toml`,
 since 1.17 is unreleased). The first build compiles Slint from source and takes a
 while.
 
+### Running in the terminal (sixel backend)
+
+Harbor ships a custom Slint backend that draws the whole UI **inside a terminal**
+using the [sixel](https://en.wikipedia.org/wiki/Sixel) graphics protocol — no
+windowing system required:
+
+```sh
+cargo run -- --sixel          # or: HARBOR_BACKEND=sixel cargo run
+```
+
+It drives Slint's software renderer into an RGB framebuffer, encodes each frame as
+a sixel image (pure-Rust `icy_sixel`, no C dependency) and writes it to the
+terminal. Keyboard and mouse input are read in raw mode with SGR mouse reporting
+(`crossterm`) and translated into Slint events, so clicking, ⌘/Ctrl- and
+Shift-selection, scrolling, and keyboard shortcuts all work. Press **Ctrl-C** or
+**Ctrl-Q** to quit.
+
+Needs a sixel-capable terminal that also reports its pixel size (for crisp output
+and correct mouse mapping): **WezTerm**, **foot**, **mlterm**, **Konsole**, **xterm
+-ti vt340**, or Windows Terminal ≥ 1.22. The implementation lives in
+`src/sixel_backend.rs`.
+
 ## Features
 
 - **Theming** — System / Light / Dark, following the OS color scheme via Slint's
@@ -63,6 +85,7 @@ while.
 |---|---|
 | `src/data.rs` | Mock filesystem tree, drives, kind/tag tables, byte/date formatters (ported from `data.js`). |
 | `src/main.rs` | App state (navigation, selection, sort, theme), callback wiring, and the live `slint::Timer`s. Pushes `ModelRc`s into the UI. |
+| `src/sixel_backend.rs` | Custom Slint `Platform` that renders the UI to a terminal via sixels (software renderer → RGB → `icy_sixel`) with `crossterm` keyboard/mouse input. Enabled by `--sixel`. |
 | `ui/theme.slint` | `Theme` global — all color/spacing tokens, light/dark pairs, tag palette. |
 | `ui/icons.slint` | Auto-generated geometric line glyphs (see `tools/gen_icons.py`). |
 | `ui/widgets.slint` | Reusable `Icon`, `IconButton`, `Meter`, `TagDot`, `MenuItem`, … |
