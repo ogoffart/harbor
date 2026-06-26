@@ -6,9 +6,13 @@ edition = "2021"
 [dependencies]
 slint = { git = "https://github.com/slint-ui/slint", branch = "master" }
 chrono = "0.4"
-# Terminal/sixel backend (see src/sixel_backend.rs):
+# Terminal backend (see src/terminal_backend.rs): sixel + Kitty graphics protocols.
 crossterm = "0.28"
 icy_sixel = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+# Timed raw read of the terminal's capability replies during protocol detection.
+libc = "0.2"
 
 [build-dependencies]
 slint-build = { git = "https://github.com/slint-ui/slint", branch = "master" }

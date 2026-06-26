@@ -2,7 +2,7 @@
 slint::include_modules!();
 
 mod data;
-mod sixel_backend;
+mod terminal_backend;
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -693,17 +693,19 @@ fn collect_all(node: &NodeRef, pred: &dyn Fn(&Node) -> bool, out: &mut Vec<NodeR
     }
 }
 
-/// Whether to draw the UI in the terminal via the sixel backend instead of a native
-/// window. Enabled with the `--sixel` argument or `HARBOR_BACKEND=sixel`.
-fn wants_sixel_backend() -> bool {
-    std::env::args().skip(1).any(|a| a == "--sixel")
-        || std::env::var("HARBOR_BACKEND").map(|v| v == "sixel").unwrap_or(false)
+/// Whether to draw the UI in the terminal (sixel / Kitty graphics) instead of a native
+/// window. Enabled with `--sixel`/`--tui` or `HARBOR_BACKEND=sixel|terminal|tui`.
+fn wants_terminal_backend() -> bool {
+    std::env::args().skip(1).any(|a| a == "--sixel" || a == "--tui")
+        || std::env::var("HARBOR_BACKEND")
+            .map(|v| matches!(v.as_str(), "sixel" | "terminal" | "tui"))
+            .unwrap_or(false)
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    // Install the terminal/sixel platform before any Slint component is created.
-    if wants_sixel_backend() {
-        sixel_backend::init()?;
+    // Install the terminal platform before any Slint component is created.
+    if wants_terminal_backend() {
+        terminal_backend::init()?;
     }
 
     let (root, drives, next_id, now) = build();

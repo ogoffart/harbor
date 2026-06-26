@@ -38,27 +38,34 @@ Uses **Slint 1.17 from the `master` branch** (git dependency in `Cargo.toml`,
 since 1.17 is unreleased). The first build compiles Slint from source and takes a
 while.
 
-### Running in the terminal (sixel backend)
+### Running in the terminal (sixel / Kitty graphics)
 
-Harbor ships a custom Slint backend that draws the whole UI **inside a terminal**
-using the [sixel](https://en.wikipedia.org/wiki/Sixel) graphics protocol — no
-windowing system required:
+Harbor ships a custom Slint backend that draws the whole UI **inside a terminal** —
+no windowing system required:
 
 ```sh
-cargo run -- --sixel          # or: HARBOR_BACKEND=sixel cargo run
+cargo run -- --tui            # or: --sixel, or HARBOR_BACKEND=terminal cargo run
 ```
 
-It drives Slint's software renderer into an RGB framebuffer, encodes each frame as
-a sixel image (pure-Rust `icy_sixel`, no C dependency) and writes it to the
-terminal. Keyboard and mouse input are read in raw mode with SGR mouse reporting
-(`crossterm`) and translated into Slint events, so clicking, ⌘/Ctrl- and
+It drives Slint's software renderer into an RGB framebuffer and streams each frame
+using **the best image protocol the terminal supports**, picked automatically at
+start-up by querying the terminal in-band (so detection also works over `ssh`):
+
+- the [**Kitty graphics protocol**](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+  — true-color; used by kitty, Ghostty, WezTerm, Konsole, …
+- the [**sixel**](https://en.wikipedia.org/wiki/Sixel) protocol (pure-Rust
+  `icy_sixel`, no C dependency) — used by xterm `-ti vt340`, foot, mlterm, iTerm2,
+  Windows Terminal ≥ 1.22, …
+
+Force a specific protocol with `HARBOR_IMAGE_PROTOCOL=kitty|sixel` if detection
+guesses wrong. Keyboard and mouse input are read in raw mode with SGR mouse
+reporting (`crossterm`) and translated into Slint events, so clicking, ⌘/Ctrl- and
 Shift-selection, scrolling, and keyboard shortcuts all work. Press **Ctrl-C** or
 **Ctrl-Q** to quit.
 
-Needs a sixel-capable terminal that also reports its pixel size (for crisp output
-and correct mouse mapping): **WezTerm**, **foot**, **mlterm**, **Konsole**, **xterm
--ti vt340**, or Windows Terminal ≥ 1.22. The implementation lives in
-`src/sixel_backend.rs`.
+For crisp output and correct mouse mapping the terminal should also report its
+pixel size (`CSI 14 t`); most of the terminals above do, and SSH forwards it. The
+implementation lives in `src/terminal_backend.rs`.
 
 ## Features
 
@@ -85,7 +92,7 @@ and correct mouse mapping): **WezTerm**, **foot**, **mlterm**, **Konsole**, **xt
 |---|---|
 | `src/data.rs` | Mock filesystem tree, drives, kind/tag tables, byte/date formatters (ported from `data.js`). |
 | `src/main.rs` | App state (navigation, selection, sort, theme), callback wiring, and the live `slint::Timer`s. Pushes `ModelRc`s into the UI. |
-| `src/sixel_backend.rs` | Custom Slint `Platform` that renders the UI to a terminal via sixels (software renderer → RGB → `icy_sixel`) with `crossterm` keyboard/mouse input. Enabled by `--sixel`. |
+| `src/terminal_backend.rs` | Custom Slint `Platform` that renders the UI to a terminal via the Kitty graphics or sixel protocol (auto-detected; software renderer → RGB → `icy_sixel`/Kitty) with `crossterm` keyboard/mouse input. Enabled by `--tui`/`--sixel`. |
 | `ui/theme.slint` | `Theme` global — all color/spacing tokens, light/dark pairs, tag palette. |
 | `ui/icons.slint` | Auto-generated geometric line glyphs (see `tools/gen_icons.py`). |
 | `ui/widgets.slint` | Reusable `Icon`, `IconButton`, `Meter`, `TagDot`, `MenuItem`, … |

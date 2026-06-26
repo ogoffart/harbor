@@ -1,21 +1,27 @@
-//! A Slint backend that draws the UI in a terminal using the **sixel** graphics protocol.
+//! A Slint backend that draws the UI in a terminal using inline-image protocols.
 //!
 //! Instead of opening a native window, this [`Platform`] implementation drives Slint's
-//! [`SoftwareRenderer`] into an in-memory RGB framebuffer, encodes that frame as sixels
-//! (via the pure-Rust [`icy_sixel`] crate) and writes it to the terminal. Keyboard and
-//! mouse input are read from the terminal in raw mode with SGR mouse reporting (through
+//! [`SoftwareRenderer`] into an in-memory RGB framebuffer and streams that frame to the
+//! terminal using the **best image protocol the terminal supports**:
+//!
+//! * the **Kitty graphics protocol** (true-color, used by kitty, Ghostty, WezTerm,
+//!   Konsole, …), or
+//! * the **sixel** protocol (xterm, foot, mlterm, iTerm2, Windows Terminal, …),
+//!
+//! chosen at start-up by querying the terminal in-band (so detection also works across
+//! `ssh`, where environment variables such as `TERM_PROGRAM` don't propagate).
+//!
+//! Keyboard and mouse input are read in raw mode with SGR mouse reporting (through
 //! [`crossterm`]) and translated into Slint [`WindowEvent`]s.
 //!
-//! Enable it from `main` by calling [`init`] before creating any Slint component. The app
-//! then renders entirely inside a sixel-capable terminal (xterm with sixel support,
-//! WezTerm, foot, mlterm, Konsole, …).
+//! Enable it from `main` by calling [`init`] before creating any Slint component.
 
 use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{
@@ -32,6 +38,15 @@ use crossterm::{cursor, execute, terminal};
 use icy_sixel::{
     sixel_string, DiffusionMethod, MethodForLargest, MethodForRep, PixelFormat, Quality,
 };
+
+/// The inline-image protocol used to push frames to the terminal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImageProtocol {
+    /// Kitty graphics protocol — true-color, preferred when available.
+    Kitty,
+    /// DEC sixel — 256-color, the widely supported fallback.
+    Sixel,
+}
 
 /// Geometry of the terminal text area, refreshed whenever the terminal is resized.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -84,17 +99,19 @@ impl EventLoopProxy for Proxy {
     }
 }
 
-/// The sixel terminal backend.
-pub struct SixelBackend {
+/// The terminal backend.
+pub struct TerminalBackend {
     window: Rc<MinimalSoftwareWindow>,
     shared: Arc<Shared>,
     /// Persistent framebuffer; kept across frames so the software renderer can render
     /// only the dirty region ([`RepaintBufferType::ReusedBuffer`]).
     framebuffer: RefCell<Vec<Rgb8Pixel>>,
     geometry: Cell<Geometry>,
+    /// The image protocol chosen at start-up.
+    protocol: Cell<ImageProtocol>,
 }
 
-impl SixelBackend {
+impl TerminalBackend {
     fn new() -> Self {
         // ReusedBuffer: the renderer keeps previously drawn pixels and only repaints the
         // dirty region into our persistent buffer, which is exactly what we re-encode.
@@ -104,6 +121,7 @@ impl SixelBackend {
             shared: Arc::new(Shared::default()),
             framebuffer: RefCell::new(Vec::new()),
             geometry: Cell::new(Geometry::default()),
+            protocol: Cell::new(ImageProtocol::Sixel),
         }
     }
 
@@ -139,7 +157,7 @@ impl SixelBackend {
         Ok(true)
     }
 
-    /// Render the current frame and write it to the terminal as a sixel image.
+    /// Render the current frame (if dirty) and write it to the terminal.
     fn emit_frame(&self, out: &mut impl Write) -> io::Result<()> {
         let geom = self.geometry.get();
         let (w, h) = (geom.width as usize, geom.height as usize);
@@ -153,33 +171,20 @@ impl SixelBackend {
             return Ok(());
         }
 
-        // Flatten the RGB pixels into the byte layout icy_sixel expects (RGB888).
+        // Flatten the RGB pixels into a plain RGB888 byte buffer.
         let fb = self.framebuffer.borrow();
-        let mut bytes = Vec::with_capacity(w * h * 3);
+        let mut rgb = Vec::with_capacity(w * h * 3);
         for px in fb.iter() {
-            bytes.push(px.r);
-            bytes.push(px.g);
-            bytes.push(px.b);
+            rgb.push(px.r);
+            rgb.push(px.g);
+            rgb.push(px.b);
         }
         drop(fb);
 
-        if let Ok(sixel) = sixel_string(
-            &bytes,
-            w as i32,
-            h as i32,
-            PixelFormat::RGB888,
-            DiffusionMethod::Atkinson,
-            MethodForLargest::Auto,
-            MethodForRep::Auto,
-            Quality::LOW,
-        ) {
-            // Move to the home position and draw the frame in place (no trailing newline,
-            // so the terminal does not scroll).
-            out.write_all(b"\x1b[H")?;
-            out.write_all(sixel.as_bytes())?;
-            out.flush()?;
+        match self.protocol.get() {
+            ImageProtocol::Kitty => emit_kitty(out, w as u32, h as u32, &rgb),
+            ImageProtocol::Sixel => emit_sixel(out, w as i32, h as i32, &rgb),
         }
-        Ok(())
     }
 
     /// Translate one terminal event into Slint window events.
@@ -297,7 +302,7 @@ impl SixelBackend {
     }
 }
 
-impl Platform for SixelBackend {
+impl Platform for TerminalBackend {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         Ok(self.window.clone())
     }
@@ -310,6 +315,7 @@ impl Platform for SixelBackend {
         let mut out = io::stdout();
         let _guard = TerminalGuard::enter().map_err(io_err)?;
 
+        self.protocol.set(detect_protocol(&mut out).map_err(io_err)?);
         self.sync_geometry().map_err(io_err)?;
         // The software renderer defaults to a scale factor of 1; make it explicit.
         self.window
@@ -348,19 +354,197 @@ impl Platform for SixelBackend {
 
             self.emit_frame(&mut out).map_err(io_err)?;
         }
+
+        if self.protocol.get() == ImageProtocol::Kitty {
+            // Remove our images before leaving the alternate screen.
+            let _ = out.write_all(b"\x1b_Ga=d\x1b\\");
+            let _ = out.flush();
+        }
         Ok(())
     }
 }
 
-/// Install the sixel backend as the active Slint platform. Call this once, before any
+/// Install the terminal backend as the active Slint platform. Call this once, before any
 /// Slint component is created.
 pub fn init() -> Result<(), PlatformError> {
-    slint::platform::set_platform(Box::new(SixelBackend::new()))
+    slint::platform::set_platform(Box::new(TerminalBackend::new()))
         .map_err(PlatformError::SetPlatformError)
 }
 
+// ---------------------------------------------------------------------------
+// Capability detection
+// ---------------------------------------------------------------------------
+
+/// Decide which image protocol to use. An explicit `HARBOR_IMAGE_PROTOCOL=kitty|sixel`
+/// wins; otherwise the terminal is queried in-band and Kitty is preferred over sixel.
+fn detect_protocol(out: &mut impl Write) -> io::Result<ImageProtocol> {
+    if let Ok(forced) = std::env::var("HARBOR_IMAGE_PROTOCOL") {
+        match forced.to_ascii_lowercase().as_str() {
+            "kitty" => return Ok(ImageProtocol::Kitty),
+            "sixel" => return Ok(ImageProtocol::Sixel),
+            _ => {}
+        }
+    }
+
+    // Ask the terminal two things at once:
+    //  * a Kitty graphics query (APC `_Gi=…,a=q…`) — a Kitty-capable terminal answers
+    //    with `_Gi=<id>;OK`, others ignore the (consumed) APC string;
+    //  * Primary Device Attributes (`CSI c`) — every terminal answers, and a sixel
+    //    terminal advertises attribute `4`. The DA reply also acts as the sentinel that
+    //    tells us the responses are complete.
+    out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")?;
+    out.write_all(b"\x1b[c")?;
+    out.flush()?;
+
+    let reply = read_terminal_reply(Duration::from_millis(250));
+    if contains(&reply, b"\x1b_G") && contains(&reply, b";OK") {
+        return Ok(ImageProtocol::Kitty);
+    }
+    if da1_has_sixel(&reply) {
+        return Ok(ImageProtocol::Sixel);
+    }
+    // Nothing useful came back (e.g. a terminal that doesn't answer DA): fall back to
+    // sixel, the most broadly understood protocol.
+    Ok(ImageProtocol::Sixel)
+}
+
+/// Does a Primary Device Attributes reply (`CSI ? … c`) advertise sixel (attribute `4`)?
+fn da1_has_sixel(buf: &[u8]) -> bool {
+    let Some(start) = find(buf, b"\x1b[?") else { return false };
+    let body = &buf[start + 3..];
+    let Some(end) = body.iter().position(|&b| b == b'c') else { return false };
+    body[..end].split(|&b| b == b';').any(|tok| tok == b"4")
+}
+
+#[cfg(unix)]
+fn read_terminal_reply(timeout: Duration) -> Vec<u8> {
+    use std::os::unix::io::AsRawFd;
+    let fd = io::stdin().as_raw_fd();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 256];
+    let start = Instant::now();
+    loop {
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else { break };
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: `pfd` is a valid, initialized pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready <= 0 {
+            break;
+        }
+        // SAFETY: `tmp` is a valid writable buffer of `tmp.len()` bytes.
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+        // Stop as soon as the Device Attributes reply (terminated by `c`) has arrived.
+        if da1_complete(&buf) {
+            break;
+        }
+    }
+    buf
+}
+
+#[cfg(not(unix))]
+fn read_terminal_reply(_timeout: Duration) -> Vec<u8> {
+    // No portable timed raw read here; rely on HARBOR_IMAGE_PROTOCOL or the sixel default.
+    Vec::new()
+}
+
+/// Has a complete DA reply (`ESC [ ? … c`) been received?
+fn da1_complete(buf: &[u8]) -> bool {
+    match find(buf, b"\x1b[?") {
+        Some(p) => buf[p + 2..].iter().any(|&b| b == b'c'),
+        None => false,
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    find(haystack, needle).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Frame encoders
+// ---------------------------------------------------------------------------
+
+/// Encode the frame as sixels and draw it at the home position.
+fn emit_sixel(out: &mut impl Write, w: i32, h: i32, rgb: &[u8]) -> io::Result<()> {
+    if let Ok(sixel) = sixel_string(
+        rgb,
+        w,
+        h,
+        PixelFormat::RGB888,
+        DiffusionMethod::Atkinson,
+        MethodForLargest::Auto,
+        MethodForRep::Auto,
+        Quality::LOW,
+    ) {
+        // Home, then draw in place (no trailing newline so the terminal does not scroll).
+        out.write_all(b"\x1b[H")?;
+        out.write_all(sixel.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// Push the frame using the Kitty graphics protocol (true-color, 24-bit RGB).
+fn emit_kitty(out: &mut impl Write, w: u32, h: u32, rgb: &[u8]) -> io::Result<()> {
+    // Home, drop the previous frame's image, then transmit-and-display the new one.
+    out.write_all(b"\x1b[H")?;
+    out.write_all(b"\x1b_Ga=d\x1b\\")?;
+
+    let payload = base64_encode(rgb);
+    let bytes = payload.as_bytes();
+    // Kitty requires the base64 payload to be split into <= 4096-byte chunks.
+    const CHUNK: usize = 4096;
+    let mut offset = 0;
+    let mut first = true;
+    while offset < bytes.len() {
+        let end = (offset + CHUNK).min(bytes.len());
+        let more = if end < bytes.len() { 1 } else { 0 };
+        if first {
+            // a=T transmit+display, f=24 RGB, s/v dimensions, q=2 suppress replies.
+            write!(out, "\x1b_Ga=T,f=24,s={w},v={h},q=2,m={more};")?;
+            first = false;
+        } else {
+            write!(out, "\x1b_Gm={more};")?;
+        }
+        out.write_all(&bytes[offset..end])?;
+        out.write_all(b"\x1b\\")?;
+        offset = end;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Standard (RFC 4648) base64 with padding.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        s.push(TABLE[(n >> 18 & 63) as usize] as char);
+        s.push(TABLE[(n >> 12 & 63) as usize] as char);
+        s.push(if chunk.len() > 1 { TABLE[(n >> 6 & 63) as usize] as char } else { '=' });
+        s.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Input translation
+// ---------------------------------------------------------------------------
+
 fn io_err(e: io::Error) -> PlatformError {
-    PlatformError::Other(format!("sixel terminal backend: {e}"))
+    PlatformError::Other(format!("terminal backend: {e}"))
 }
 
 fn map_button(b: MouseButton) -> PointerEventButton {
