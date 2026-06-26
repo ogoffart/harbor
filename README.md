@@ -52,7 +52,8 @@ using **the best image protocol the terminal supports**, picked automatically at
 start-up by querying the terminal in-band (so detection also works over `ssh`):
 
 - the [**Kitty graphics protocol**](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
-  — true-color; used by kitty, Ghostty, WezTerm, Konsole, …
+  — true-color, zlib-compressed, double-buffered (flicker-free); used by kitty,
+  Ghostty, WezTerm, Konsole, …
 - the [**sixel**](https://en.wikipedia.org/wiki/Sixel) protocol (pure-Rust
   `icy_sixel`, no C dependency) — used by xterm `-ti vt340`, foot, mlterm, iTerm2,
   Windows Terminal ≥ 1.22, …

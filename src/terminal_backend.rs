@@ -35,9 +35,9 @@ use crossterm::event::{
 };
 use crossterm::{cursor, execute, terminal};
 
-use icy_sixel::{
-    sixel_string, DiffusionMethod, MethodForLargest, MethodForRep, PixelFormat, Quality,
-};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use icy_sixel::{EncodeOptions, SixelImage};
 
 /// The inline-image protocol used to push frames to the terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -109,6 +109,9 @@ pub struct TerminalBackend {
     geometry: Cell<Geometry>,
     /// The image protocol chosen at start-up.
     protocol: Cell<ImageProtocol>,
+    /// Id of the Kitty image currently on screen (for double-buffered, flicker-free
+    /// updates); `0` means none yet.
+    kitty_prev: Cell<u32>,
 }
 
 impl TerminalBackend {
@@ -122,6 +125,7 @@ impl TerminalBackend {
             framebuffer: RefCell::new(Vec::new()),
             geometry: Cell::new(Geometry::default()),
             protocol: Cell::new(ImageProtocol::Sixel),
+            kitty_prev: Cell::new(0),
         }
     }
 
@@ -171,19 +175,17 @@ impl TerminalBackend {
             return Ok(());
         }
 
-        // Flatten the RGB pixels into a plain RGB888 byte buffer.
+        // Flatten into an RGBA byte buffer (both encoders consume RGBA).
         let fb = self.framebuffer.borrow();
-        let mut rgb = Vec::with_capacity(w * h * 3);
+        let mut rgba = Vec::with_capacity(w * h * 4);
         for px in fb.iter() {
-            rgb.push(px.r);
-            rgb.push(px.g);
-            rgb.push(px.b);
+            rgba.extend_from_slice(&[px.r, px.g, px.b, 255]);
         }
         drop(fb);
 
         match self.protocol.get() {
-            ImageProtocol::Kitty => emit_kitty(out, w as u32, h as u32, &rgb),
-            ImageProtocol::Sixel => emit_sixel(out, w as i32, h as i32, &rgb),
+            ImageProtocol::Kitty => emit_kitty(out, w as u32, h as u32, &rgba, &self.kitty_prev),
+            ImageProtocol::Sixel => emit_sixel(out, w, h, rgba),
         }
     }
 
@@ -275,6 +277,11 @@ impl TerminalBackend {
             Event::Resize(..) => {
                 if self.sync_geometry()? {
                     execute!(out, terminal::Clear(terminal::ClearType::All))?;
+                    if self.protocol.get() == ImageProtocol::Kitty {
+                        // Drop all images so a stale-sized frame can't linger.
+                        out.write_all(b"\x1b_Ga=d\x1b\\")?;
+                        self.kitty_prev.set(0);
+                    }
                 }
             }
             Event::FocusGained => win.dispatch_event(WindowEvent::WindowActiveChanged(true)),
@@ -473,17 +480,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Encode the frame as sixels and draw it at the home position.
-fn emit_sixel(out: &mut impl Write, w: i32, h: i32, rgb: &[u8]) -> io::Result<()> {
-    if let Ok(sixel) = sixel_string(
-        rgb,
-        w,
-        h,
-        PixelFormat::RGB888,
-        DiffusionMethod::Atkinson,
-        MethodForLargest::Auto,
-        MethodForRep::Auto,
-        Quality::LOW,
-    ) {
+fn emit_sixel(out: &mut impl Write, w: usize, h: usize, rgba: Vec<u8>) -> io::Result<()> {
+    // Slightly reduced diffusion keeps flat UI surfaces and text crisp.
+    let opts = EncodeOptions { max_colors: 256, diffusion: 0.3, ..Default::default() };
+    let encoded = SixelImage::try_from_rgba(rgba, w, h).and_then(|img| img.encode_with(&opts));
+    if let Ok(sixel) = encoded {
         // Home, then draw in place (no trailing newline so the terminal does not scroll).
         out.write_all(b"\x1b[H")?;
         out.write_all(sixel.as_bytes())?;
@@ -492,25 +493,42 @@ fn emit_sixel(out: &mut impl Write, w: i32, h: i32, rgb: &[u8]) -> io::Result<()
     Ok(())
 }
 
-/// Push the frame using the Kitty graphics protocol (true-color, 24-bit RGB).
-fn emit_kitty(out: &mut impl Write, w: u32, h: u32, rgb: &[u8]) -> io::Result<()> {
-    // Home, drop the previous frame's image, then transmit-and-display the new one.
-    out.write_all(b"\x1b[H")?;
-    out.write_all(b"\x1b_Ga=d\x1b\\")?;
+/// Push the frame using the Kitty graphics protocol (true-color RGBA, zlib-compressed).
+///
+/// To avoid the flash some terminals show when an image is deleted before the next is
+/// drawn, this double-buffers: it draws the new frame (on top, at the same spot) and only
+/// then deletes the previous frame underneath. `prev` holds the image id still on screen.
+fn emit_kitty(
+    out: &mut impl Write,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+    prev: &Cell<u32>,
+) -> io::Result<()> {
+    let old = prev.get();
+    let id = if old == 1 { 2 } else { 1 };
 
-    let payload = base64_encode(rgb);
+    // zlib-compress the pixels (the constant alpha plane shrinks this dramatically).
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(rgba)?;
+    let compressed = enc.finish()?;
+    let payload = base64_encode(&compressed);
     let bytes = payload.as_bytes();
+
+    // Place the new frame at the home position.
+    out.write_all(b"\x1b[H")?;
     // Kitty requires the base64 payload to be split into <= 4096-byte chunks.
     const CHUNK: usize = 4096;
     let mut offset = 0;
-    let mut first = true;
+    let mut firstchunk = true;
     while offset < bytes.len() {
         let end = (offset + CHUNK).min(bytes.len());
         let more = if end < bytes.len() { 1 } else { 0 };
-        if first {
-            // a=T transmit+display, f=24 RGB, s/v dimensions, q=2 suppress replies.
-            write!(out, "\x1b_Ga=T,f=24,s={w},v={h},q=2,m={more};")?;
-            first = false;
+        if firstchunk {
+            // a=T transmit+display, f=32 RGBA, o=z zlib, i=id, C=1 don't move the cursor,
+            // q=2 suppress replies.
+            write!(out, "\x1b_Ga=T,f=32,o=z,s={w},v={h},i={id},C=1,q=2,m={more};")?;
+            firstchunk = false;
         } else {
             write!(out, "\x1b_Gm={more};")?;
         }
@@ -518,6 +536,12 @@ fn emit_kitty(out: &mut impl Write, w: u32, h: u32, rgb: &[u8]) -> io::Result<()
         out.write_all(b"\x1b\\")?;
         offset = end;
     }
+
+    // The new frame now covers the old one; delete the previous image (d=I frees its data).
+    if old != 0 {
+        write!(out, "\x1b_Ga=d,d=I,i={old}\x1b\\")?;
+    }
+    prev.set(id);
     out.flush()?;
     Ok(())
 }
