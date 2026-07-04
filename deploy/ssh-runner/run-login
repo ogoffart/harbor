@@ -1,0 +1,5 @@
+#!/bin/sh
+# Forced SSH command: exec the program named by $APP at container start.
+# $APP may include arguments (parsed by the shell), e.g. "/opt/app --tui".
+set -eu
+exec sh -c "$(cat /etc/ssh-runner.app)"

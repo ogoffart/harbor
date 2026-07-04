@@ -8,12 +8,15 @@ sixel or the Kitty graphics protocol (WezTerm, kitty, Ghostty, foot, Konsole,
 iTerm2, …). SSH forwards the terminal's pixel size, so output is crisp and the
 mouse maps correctly.
 
-There are two ways to set this up:
+There are three ways to set this up:
 
 - **[Option A — bare metal](#option-a--bare-metal-sshd--bubblewrap)**: your host's
   `sshd` plus a `bubblewrap` sandbox.
-- **[Option B — Docker](#option-b--docker)**: a self-contained container running
+- **[Option B — Docker](#option-b--docker)**: a self-contained Harbor image running
   its own `sshd` on a port you choose. The container *is* the sandbox.
+- **[Option C — generic `ssh-runner`](#option-c--generic-ssh-runner-any-program-no-password)**:
+  an app-agnostic container that runs *any* program you mount, logging in with no
+  password by default.
 
 ---
 
@@ -156,3 +159,22 @@ crisp output. **Ctrl-C** / **Ctrl-Q** quit. Force a protocol with
 > policy blocks Docker Hub and the Slint git dependency), so build it in your own
 > environment. The `sshd`/`ForceCommand` wiring matches the bare-metal setup
 > above, which was verified end to end.
+
+---
+
+## Option C — generic `ssh-runner` (any program, no password)
+
+If you don't want a Harbor-specific image, [`ssh-runner/`](ssh-runner/) is an
+app-agnostic container: it runs `sshd` on a port you choose and drops each
+connection straight into a program you point it at with `-e APP=`, logging the
+user in automatically with **no password** by default. Mount your (statically
+built) binary and go:
+
+```sh
+docker build -t ssh-runner deploy/ssh-runner
+docker run -d -p 2222:2222 -v /path/to/prog:/opt/app:ro -e APP='/opt/app --tui' ssh-runner
+ssh -p 2222 app@your-host
+```
+
+See [`ssh-runner/README.md`](ssh-runner/README.md) for auth modes (anonymous vs.
+key), IPv6, and the security note.
