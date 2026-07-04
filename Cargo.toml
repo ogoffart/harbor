@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-slint = { git = "https://github.com/slint-ui/slint", branch = "master" }
+# Default features are dropped so the desktop GUI stack (winit/femtovg and its
+# X11/OpenGL system deps) lives behind the `desktop` feature; a headless / SSH
+# build uses `--no-default-features` and only pulls the software renderer.
+slint = { git = "https://github.com/slint-ui/slint", branch = "master", default-features = false, features = ["compat-1-2", "std", "renderer-software"] }
 chrono = "0.4.45"
 # Terminal backend (see src/terminal_backend.rs): sixel + Kitty graphics protocols.
 crossterm = "0.29"
@@ -14,6 +17,17 @@ flate2 = "1.1"
 [target.'cfg(unix)'.dependencies]
 # Timed raw read of the terminal's capability replies during protocol detection.
 libc = "0.2.186"
+
+[features]
+# Native desktop window (winit + femtovg) — on by default, so `cargo run` is
+# unchanged. Build a headless/terminal-only binary with `--no-default-features`.
+default = ["desktop"]
+desktop = [
+    "slint/backend-default",
+    "slint/renderer-femtovg",
+    "slint/accessibility",
+    "slint/system-tray",
+]
 
 [build-dependencies]
 slint-build = { git = "https://github.com/slint-ui/slint", branch = "master" }

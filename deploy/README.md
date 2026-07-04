@@ -8,18 +8,32 @@ sixel or the Kitty graphics protocol (WezTerm, kitty, Ghostty, foot, Konsole,
 iTerm2, …). SSH forwards the terminal's pixel size, so output is crisp and the
 mouse maps correctly.
 
+There are two ways to set this up:
+
+- **[Option A — bare metal](#option-a--bare-metal-sshd--bubblewrap)**: your host's
+  `sshd` plus a `bubblewrap` sandbox.
+- **[Option B — Docker](#option-b--docker)**: a self-contained container running
+  its own `sshd` on a port you choose. The container *is* the sandbox.
+
+---
+
+## Option A — bare metal (sshd + bubblewrap)
+
 > Requires a Linux host with OpenSSH and [`bubblewrap`](https://github.com/containers/bubblewrap)
 > (`bwrap`). `sudo apt install bubblewrap` / `dnf install bubblewrap`.
 
-## 1. Build and install the binary
+### 1. Build and install the binary
+
+`--no-default-features` builds the terminal-only binary (no winit/femtovg, so no
+X11/OpenGL build or runtime dependencies):
 
 ```sh
-cargo build --release
+cargo build --release --no-default-features
 sudo install -Dm755 target/release/harbor /usr/local/bin/harbor
 sudo install -Dm755 deploy/harbor-login  /usr/local/bin/harbor-login
 ```
 
-## 2. Create the dedicated user and its data directory
+### 2. Create the dedicated user and its data directory
 
 ```sh
 sudo useradd -m -d /srv/harbor -s /usr/sbin/nologin harbor
@@ -34,7 +48,7 @@ sudo -u harbor tee /srv/harbor/.ssh/authorized_keys < your_key.pub
 sudo -u harbor chmod 600 /srv/harbor/.ssh/authorized_keys
 ```
 
-## 3. Wire it into sshd
+### 3. Wire it into sshd
 
 ```sh
 sudo install -m644 deploy/sshd_harbor.conf /etc/ssh/sshd_config.d/harbor.conf
@@ -44,7 +58,7 @@ sudo sshd -t && sudo systemctl reload ssh
 `ForceCommand` runs `harbor-login` no matter what the client asks for, so
 `ssh harbor@host /bin/sh` cannot get a shell.
 
-## 4. Connect
+### 4. Connect
 
 ```sh
 ssh harbor@your-host
@@ -55,7 +69,7 @@ quit and close the session. Force a protocol with
 `HARBOR_IMAGE_PROTOCOL=kitty|sixel` if auto-detection guesses wrong (set it in
 `harbor-login`, since SSH won't forward arbitrary env vars).
 
-## What the sandbox allows
+### What the sandbox allows
 
 `harbor-login` uses `bwrap` to give each session:
 
@@ -74,7 +88,7 @@ in the environment, or edit the defaults at the top of `harbor-login`.
 > scope of a browsing feature. It's the right thing to have in place before
 > wiring Harbor up to real files.
 
-## Hardening / limits (optional)
+### Hardening / limits (optional)
 
 Each connection runs a render loop, so consider capping resources — e.g. launch
 under a transient systemd scope from `harbor-login`:
@@ -87,3 +101,58 @@ exec systemd-run --quiet --scope -p CPUQuota=50% -p MemoryMax=256M \
 and add `MaxStartups`, `LoginGraceTime`, and per-key `restrict` options in
 `authorized_keys`. Stronger isolation is available by swapping `bwrap` for a
 container (`podman run --rm -i --network=none -v /srv/harbor/data:/data …`).
+
+---
+
+## Option B — Docker
+
+A self-contained image that runs its own `sshd` on a port you choose. See
+[`Dockerfile`](Dockerfile) — it builds the terminal-only binary
+(`--no-default-features`) and ships it with `sshd`, fonts, and the launcher. Here
+the **container is the sandbox**: only the mounted data volume is writable and
+the app has no network features, so `bubblewrap` is skipped inside it.
+
+### Build
+
+```sh
+docker build -t harbor-ssh -f deploy/Dockerfile .
+```
+
+### Run (pick your port)
+
+```sh
+docker run -d --name harbor \
+    -p 2222:2222 \
+    -e AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" \
+    -v harbor-keys:/etc/ssh \
+    -v harbor-data:/srv/harbor/data \
+    harbor-ssh
+```
+
+- **Port**: `-p HOST:2222` maps a host port to the container's sshd. To change
+  the in-container port too, add `-e SSH_PORT=2200 -p 2200:2200`.
+- **IPv6**: on a dual-stack Docker host, `-p 2222:2222` binds both families;
+  to bind IPv6 explicitly use `-p '[::]:2222:2222'` (requires the daemon's
+  `ipv6`/`ip6tables` support enabled).
+- **Keys**: pass `AUTHORIZED_KEYS` inline (above) or mount a file at
+  `/srv/harbor/.ssh/authorized_keys`.
+- **Host keys**: the `harbor-keys` volume persists `/etc/ssh` so the server
+  identity is stable across `docker run`s (no client "host key changed" warnings).
+- **Data**: `harbor-data` is the only writable directory the app sees
+  (`/srv/harbor/data`); mount a host path instead if you prefer.
+
+### Connect
+
+```sh
+ssh -p 2222 harbor@your-host
+```
+
+No command → a PTY is allocated and Harbor launches. Your local terminal must
+support sixel or the Kitty graphics protocol; SSH forwards its pixel size for
+crisp output. **Ctrl-C** / **Ctrl-Q** quit. Force a protocol with
+`-e HARBOR_IMAGE_PROTOCOL=kitty|sixel` on `docker run` if detection guesses wrong.
+
+> Note: this Dockerfile could not be built in the authoring sandbox (its network
+> policy blocks Docker Hub and the Slint git dependency), so build it in your own
+> environment. The `sshd`/`ForceCommand` wiring matches the bare-metal setup
+> above, which was verified end to end.
