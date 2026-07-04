@@ -1,0 +1,51 @@
+#!/bin/sh
+# Login shell / SSH ForceCommand target for serving Harbor's terminal UI.
+#
+# It runs the Harbor binary in the terminal (sixel / Kitty graphics) backend,
+# confined by bubblewrap to a single data directory with no network access, so a
+# connecting user can only ever touch that directory.
+#
+# Configure via environment (sensible defaults shown):
+#   HARBOR_BIN    path to the harbor binary      (default: /usr/local/bin/harbor)
+#   HARBOR_DATA   the only directory exposed, RW  (default: /srv/harbor/data)
+#   HARBOR_NO_SANDBOX=1   run without bubblewrap (debugging only)
+set -eu
+
+HARBOR_BIN="${HARBOR_BIN:-/usr/local/bin/harbor}"
+HARBOR_DATA="${HARBOR_DATA:-/srv/harbor/data}"
+
+mkdir -p "$HARBOR_DATA" 2>/dev/null || true
+
+if [ "${HARBOR_NO_SANDBOX:-0}" = "1" ] || ! command -v bwrap >/dev/null 2>&1; then
+    [ "${HARBOR_NO_SANDBOX:-0}" = "1" ] || echo "warning: bubblewrap (bwrap) not found — running WITHOUT sandbox" >&2
+    exec env HARBOR_BACKEND=terminal HOME="$HARBOR_DATA" "$HARBOR_BIN"
+fi
+
+# Notes:
+#   --unshare-all           new user/pid/ipc/uts/cgroup/net namespaces (no network)
+#   --bind "$HARBOR_DATA"   the ONLY writable path, mapped to /data
+#   fonts are required or the software renderer draws no text
+#   --die-with-parent       clean up when the ssh session ends
+#   (no --new-session: it detaches the controlling tty and breaks SIGWINCH resize)
+exec bwrap \
+    --ro-bind /usr /usr \
+    --ro-bind-try /bin /bin \
+    --ro-bind-try /sbin /sbin \
+    --ro-bind-try /lib /lib \
+    --ro-bind-try /lib64 /lib64 \
+    --ro-bind-try /etc/fonts /etc/fonts \
+    --ro-bind-try /usr/share/fonts /usr/share/fonts \
+    --ro-bind-try /usr/share/fontconfig /usr/share/fontconfig \
+    --ro-bind "$HARBOR_BIN" /usr/local/bin/harbor \
+    --bind "$HARBOR_DATA" /data \
+    --proc /proc \
+    --dev /dev \
+    --tmpfs /tmp \
+    --unshare-all \
+    --die-with-parent \
+    --chdir /data \
+    --setenv HOME /data \
+    --setenv HARBOR_BACKEND terminal \
+    --setenv TERM "${TERM:-xterm-256color}" \
+    --setenv COLORTERM "${COLORTERM:-truecolor}" \
+    /usr/local/bin/harbor
